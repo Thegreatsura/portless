@@ -60,6 +60,8 @@ import {
   findFreePort,
   findPidOnPort,
   findPidsOnPort,
+  killOrphanedProcessGroup,
+  getProcessStartTime,
   getDefaultPort,
   getDefaultTlds,
   getProxyBindTargets,
@@ -525,6 +527,25 @@ function addRoutes(
     throw err;
   }
   return [...new Set(killedPids)];
+}
+
+/**
+ * Stop dev servers left running by portless sessions that died without
+ * cleanup (SIGKILL, crash). Their routes are about to be dropped as stale, and
+ * the stored process group is the only remaining link to the orphaned tree.
+ */
+function stopOrphanedProcessGroups(store: RouteStore): void {
+  const seen = new Set<number>();
+  for (const route of store.loadRoutesRaw()) {
+    const pgid = route.childPgid;
+    if (!pgid || seen.has(pgid) || route.pid === 0 || isPidAlive(route.pid)) continue;
+    seen.add(pgid);
+    if (killOrphanedProcessGroup(pgid, route.childStartTime)) {
+      console.log(
+        colors.yellow(`Stopped orphaned dev server from a previous session (process group ${pgid})`)
+      );
+    }
+  }
 }
 
 function removeRoutes(store: RouteStore, hostnames: readonly string[], ownerPid?: number): void {
@@ -1344,6 +1365,8 @@ async function runApp(
     console.log(colors.green(`-- Using port ${port}`));
   }
 
+  stopOrphanedProcessGroups(store);
+
   // Register route (--force kills the existing owner if any)
   let killedPids: number[] = [];
   try {
@@ -1568,6 +1591,16 @@ async function runApp(
       ...(tailscaleUrl ? { PORTLESS_TAILSCALE_URL: tailscaleUrl } : {}),
       ...(ngrokUrl ? { PORTLESS_NGROK_URL: ngrokUrl } : {}),
       ...caEnv,
+    },
+    onSpawn: (pid) => {
+      const childStartTime = getProcessStartTime(pid) ?? undefined;
+      for (const host of hostnames) {
+        try {
+          store.updateRoute(host, { childPgid: pid, childStartTime });
+        } catch {
+          // Without the pgid, prune falls back to the route port; non-fatal
+        }
+      }
     },
     onCleanup: () => {
       stoppingNgrok = true;
@@ -2251,13 +2284,28 @@ ${colors.bold("Options:")}
   }
 
   let killed = 0;
+  const signal = forceKill ? "SIGKILL" : "SIGTERM";
+  const killedGroups = new Set<number>();
   for (const route of stale) {
+    const pgid = route.childPgid;
+    if (
+      pgid &&
+      !killedGroups.has(pgid) &&
+      killOrphanedProcessGroup(pgid, route.childStartTime, signal)
+    ) {
+      killedGroups.add(pgid);
+      killed++;
+      console.log(`  ${route.hostname} - killed process group ${pgid} (${signal})`);
+    }
+  }
+
+  for (const route of stale) {
+    if (route.childPgid && killedGroups.has(route.childPgid)) continue;
     const pids = findPidsOnPort(route.port);
     if (pids.length === 0) {
       console.log(`  ${route.hostname} :${route.port} - route removed (port already free)`);
       continue;
     }
-    const signal = forceKill ? "SIGKILL" : "SIGTERM";
     for (const pid of pids) {
       try {
         process.kill(pid, signal);

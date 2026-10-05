@@ -1177,6 +1177,59 @@ export function findPidsOnPort(port: number): number[] {
 }
 
 /**
+ * Read a process's start time. Paired with the PID it identifies one process
+ * instance, so a recycled PID does not match. Linux reads the boot-relative
+ * tick count from /proc, which wall-clock adjustments cannot shift; other
+ * platforms use `ps` in a fixed locale and time zone. Returns null on Windows
+ * or when the process does not exist.
+ */
+export function getProcessStartTime(pid: number): string | null {
+  if (isWindows || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+      // Fields after the parenthesized command name; starttime is field 22.
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return fields[19] || null;
+    }
+    const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf-8",
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+    });
+    return output.trim().replace(/\s+/g, " ") || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Kill a process group left behind by a portless session that died without
+ * cleaning up. The group is only signaled while its leader is alive, still
+ * leads the group, and has the start time recorded at spawn, so a recycled PID
+ * is not targeted. Returns true when the signal was sent.
+ */
+export function killOrphanedProcessGroup(
+  pgid: number,
+  startTime: string | undefined,
+  signal: NodeJS.Signals = "SIGTERM"
+): boolean {
+  if (isWindows || !Number.isInteger(pgid) || pgid <= 1 || !startTime) return false;
+  try {
+    const output = execFileSync("ps", ["-o", "pgid=", "-p", String(pgid)], {
+      encoding: "utf-8",
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+    });
+    if (Number(output.trim()) !== pgid) return false;
+    if (getProcessStartTime(pgid) !== startTime) return false;
+    process.kill(-pgid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Try to find the PID of a process listening on the given TCP port.
  * Uses lsof on macOS/Linux and netstat on Windows.
  * Returns null if the PID cannot be determined.
@@ -1275,6 +1328,8 @@ export function spawnCommand(
   options?: {
     env?: NodeJS.ProcessEnv;
     onCleanup?: () => void;
+    /** Called with the child's PID, which is also its process group on Unix. */
+    onSpawn?: (pid: number) => void;
   }
 ): void {
   const env: Record<string, string | undefined> = {
@@ -1308,6 +1363,8 @@ export function spawnCommand(
         env,
         detached: true,
       });
+
+  if (!isWindows && child.pid) options?.onSpawn?.(child.pid);
 
   let exiting = false;
   let shutdownSignal: NodeJS.Signals | undefined;
